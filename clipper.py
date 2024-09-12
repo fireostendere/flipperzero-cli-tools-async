@@ -1,94 +1,81 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
-
 import sys
-import serial
+import os
+import platform
+import asyncio
+import argparse
+from pynput import keyboard
+from serial.serialutil import SerialException
 
-from flipperzero_protobuf_py.flipper_protobuf import ProtoFlipper
-from src.cli_helpers import print_hex
+if platform.system() == "Windows":
+    import msvcrt
 
-from src.helpers import print_screen_braille3 as print_screen_braille, print_lines_in_one_place, flipper_serial_by_name
-import time
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, 'flipperzero_protobuf_py'))
 
-from src.non_blocking_input import NonBlockingInput
+from flipperzero_protobuf_py.async_protopy.clients.protobuf_client import FlipperProtobufClient
+from flipperzero_protobuf_py.async_protopy.connectors.serial_connector import SerialConnector
+from flipperzero_protobuf_py.async_protopy.flipperzero_protobuf_compiled import gui_pb2
+from src.helpers import flipper_serial_by_name
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: " + sys.argv[0] + " <name or serial port>")
-        sys.exit(1)
+# Импортируем классы с функционалом
+from src.cli_helpers import setup_helpers
 
-    flp_serial = flipper_serial_by_name(sys.argv[1])
-    if flp_serial == '':
+flipper_helper, display_helper = setup_helpers()
+
+async def main():
+    parser = argparse.ArgumentParser(description="Stream screen from Flipper Zero to terminal.")
+    parser.add_argument('port', help="Serial port to connect to (e.g., COM5).")
+    parser.add_argument('mode', nargs='?', default='unicode', 
+                        help="Display mode: 'braille' for Braille, 'unicode' (default) for Unicode.")
+    
+    args = parser.parse_args()
+
+    flp_serial = flipper_serial_by_name(args.port)
+    if not flp_serial:
         print("Name or serial port is invalid")
         sys.exit(1)
 
-    flipper = serial.Serial(flp_serial, timeout=1)
-    flipper.baudrate = 230400
-    flipper.flushOutput()
-    flipper.flushInput()
+    use_braille = args.mode == 'braille'
+    running_event = asyncio.Event()
+    running_event.set()
 
-    flipper.timeout = None
+    try:
+        async with FlipperProtobufClient(SerialConnector(url=flp_serial, baud_rate=230400)) as proto:
+            flipper_helper.disable_input()
 
-    flipper.read_until(b'>: ')
-    
-    flipper.write(b"start_rpc_session\r")
-    flipper.read_until(b'\n')
+            commands = {
+                keyboard.Key.up: gui_pb2.InputKey.UP,
+                keyboard.Key.down: gui_pb2.InputKey.DOWN,
+                keyboard.Key.left: gui_pb2.InputKey.LEFT,
+                keyboard.Key.right: gui_pb2.InputKey.RIGHT,
+                keyboard.Key.enter: gui_pb2.InputKey.OK,
+                keyboard.Key.backspace: gui_pb2.InputKey.BACK,
+                keyboard.Key.delete: gui_pb2.InputKey.BACK
+            }
 
-    proto = ProtoFlipper(flipper)
+            loop = asyncio.get_running_loop()
 
-    cntr = 0
-    scr_data_str_old = None
+            with keyboard.Listener(
+                    on_press=lambda key: flipper_helper.on_press(key, proto, commands, loop, running_event),
+                    on_release=flipper_helper.on_release) as listener:
 
-    menuitems = "Controls: w,a,s,d - arrows short, W,A,S,D - arrows long, SPACE - OK, b - BACK, q - quit"
+                await asyncio.gather(
+                    flipper_helper.handle_flipper_commands(proto),
+                    flipper_helper.stream_screen(proto, display_helper.print_screen_braille if use_braille else display_helper.print_screen),
+                    flipper_helper.wait_for_exit(running_event)
+                )
+                listener.join()
 
-    # Reserve space for screen
-    print(menuitems)
-    print("\n" * int(64/4-1))
-
-    while True:
-        key = None
-        with NonBlockingInput():
-            key = sys.stdin.read(1)
-        
-        scrbytes = proto.cmd_gui_snapshot_screen()
-        scr_data_str = print_screen_braille(scrbytes, True)
-
-        if scr_data_str != scr_data_str_old or key != '':
-            print_lines_in_one_place(scr_data_str.split('\n'))
-
-            if key != '':
-                # print('tick', repr(key), print_hex(key.encode('utf-8')))
-                if key == 'q':
-                    break
-                elif key == 'w' or key == '\x1b[A':
-                    proto.cmd_gui_send_input("SHORT UP")
-                elif key == 's' or key == '\x1b[B':
-                    proto.cmd_gui_send_input("SHORT DOWN")
-                elif key == 'a' or key == '\x1b[D':
-                    proto.cmd_gui_send_input("SHORT LEFT")
-                elif key == 'd' or key == '\x1b[C':
-                    proto.cmd_gui_send_input("SHORT RIGHT")
-                elif key == ' ':
-                    proto.cmd_gui_send_input("SHORT OK")
-                elif key == 'b':
-                    proto.cmd_gui_send_input("SHORT BACK")
-                elif key == 'W':
-                    proto.cmd_gui_send_input("LONG UP")
-                elif key == 'S':
-                    proto.cmd_gui_send_input("LONG DOWN")
-                elif key == 'A':
-                    proto.cmd_gui_send_input("LONG LEFT")
-                elif key == 'D':
-                    proto.cmd_gui_send_input("LONG RIGHT")
-            
-            key = ''
-
-            scr_data_str_old = scr_data_str
-    
-        time.sleep(0.01)
-        
-        cntr += 1
-
+    except SerialException as e:
+        print(f"Error opening serial port: {e}")
+    finally:
+        if platform.system() == "Windows":
+            flipper_helper.clear_windows_input_buffer()
+        flipper_helper.enable_input()
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        flipper_helper.shutdown_program()
